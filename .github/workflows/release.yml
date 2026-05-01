@@ -1,0 +1,54 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Patch version in CMakeLists.txt
+        shell: pwsh
+        run: |
+          $v = $env:VERSION
+          (Get-Content CMakeLists.txt -Raw) `
+            -replace 'set\(CPACK_PACKAGE_VERSION "[^"]*"\)', "set(CPACK_PACKAGE_VERSION `"$v`")" `
+            -replace 'set\(CPACK_PACKAGE_FILE_NAME "[^"]*"\)', "set(CPACK_PACKAGE_FILE_NAME `"DeskIcons-$v-win64`")" |
+            Set-Content CMakeLists.txt -NoNewline
+
+      - name: Patch version in main.cpp
+        shell: pwsh
+        run: |
+          $v = $env:VERSION
+          (Get-Content src/main.cpp -Raw) `
+            -replace '(constexpr const char \*kAppVersion = )"[^"]*"', "`$1`"$v`"" |
+            Set-Content src/main.cpp -NoNewline
+
+      - name: Configure CMake
+        run: cmake -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package
+        working-directory: build
+        run: cpack -C Release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/DeskIcons-${{ env.VERSION }}-win64.zip
+          generate_release_notes: true

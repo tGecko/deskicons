@@ -1,0 +1,67 @@
+# Build outputs
+build/
+out/
+bin/
+obj/
+dist/
+packages/
+_CPack_Packages/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+DartConfiguration.tcl
+Testing/
+
+# Visual Studio / MSBuild
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.user
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.VC.opendb
+ipch/
+
+# Compiled binaries and debug symbols
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.res
+*.tlog
+*.lastbuildstate
+
+# Packages
+*.zip
+*.7z
+*.msi
+*.nupkg
+
+# Logs and local runtime artifacts
+*.log
+logs/
+DeskIcons/
+swap.journal
+active-desktop.txt
+config.ini
+
+# Editor and OS clutter
+.vscode/
+.idea/
+*.swp
+*.tmp
+*.bak
+Thumbs.db
+Desktop.ini
