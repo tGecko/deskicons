@@ -2199,6 +2199,7 @@ public:
 
     add_tray_icon();
     first_run_adopt();
+    initialize_vd_state();
     start_vd_watcher();
     log_line(paths_, std::string("tray start version ") + kAppVersion);
 
@@ -2547,12 +2548,28 @@ private:
       std::string guid = guid_to_string(*current);
       if (!last_guid_) {
         last_guid_ = guid;
+        switch_to_current_desktop(paths_, false);
       } else if (*last_guid_ != guid) {
         switch_to_current_desktop(paths_, false);
-        // show_notification(L"DeskIcons switched desktops", L"The visible
-        // Desktop icon set has been updated.");
+        //show_notification(S().notif_switched_title, S().notif_switched);
         last_guid_ = guid;
       }
+    } catch (const std::exception &ex) {
+      log_error(paths_, ex);
+    }
+  }
+
+  void initialize_vd_state() {
+    try {
+      if (!app_enabled(paths_)) {
+        return;
+      }
+      auto current = current_virtual_desktop_guid();
+      if (!current) {
+        return;
+      }
+      last_guid_ = guid_to_string(*current);
+      switch_to_current_desktop(paths_, false);
     } catch (const std::exception &ex) {
       log_error(paths_, ex);
     }
