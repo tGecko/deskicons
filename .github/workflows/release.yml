@@ -46,15 +46,16 @@ jobs:
             Set-Content app.manifest -NoNewline
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
 
-      - name: Assert Rust 1.95
+      - name: Assert Rust version
         shell: pwsh
         run: |
-          rustup toolchain install 1.95.0
-          rustup default 1.95.0
           rustc --version
           cargo --version
+          cargo clippy --version
 
       - name: Build
         run: cargo build --release
