@@ -1,11 +1,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(clippy::collapsible_if)]
 
+mod config;
+mod encoding;
+mod error;
+mod filesystem;
+mod journal;
+mod layout;
+mod path_logic;
+mod win32;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::Write;
 use std::iter::once;
 use std::mem::{self};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -17,8 +26,7 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HANDLE,
-    HINSTANCE, HWND, LPARAM, LRESULT, MAX_PATH, POINT, RPC_E_CHANGED_MODE, S_FALSE, S_OK,
-    WAIT_OBJECT_0, WPARAM,
+    HINSTANCE, HWND, LPARAM, LRESULT, MAX_PATH, POINT, S_FALSE, S_OK, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::Graphics::GdiPlus::{
@@ -31,8 +39,8 @@ use windows::Win32::Storage::FileSystem::{
     MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
 use windows::Win32::System::Com::{
-    CLSCTX_ALL, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-    CoTaskMemFree, CoUninitialize, IPersistFile, IServiceProvider,
+    CLSCTX_ALL, CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, IPersistFile,
+    IServiceProvider,
 };
 use windows::Win32::System::Console::AttachConsole;
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -43,8 +51,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_NOTIFY, KEY_SET_VALUE, REG_DWORD, REG_NOTIFY_CHANGE_LAST_SET,
     REG_OPEN_CREATE_OPTIONS, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_SZ,
-    RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteValueW, RegGetValueW,
-    RegNotifyChangeKeyValue, RegOpenKeyExW, RegSetValueExW,
+    RegCreateKeyExW, RegDeleteKeyW, RegDeleteValueW, RegGetValueW, RegNotifyChangeKeyValue,
+    RegOpenKeyExW, RegSetValueExW,
 };
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Threading::{
@@ -70,19 +78,32 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW, GWLP_USERDATA, GetCursorPos,
-    GetMessageW, GetWindowLongPtrW, HMENU, IDCANCEL, IDI_APPLICATION, IDOK, LoadIconW,
-    MB_DEFBUTTON1, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
-    MB_OKCANCEL, MESSAGEBOX_STYLE, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW,
-    PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow,
-    SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-    WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK,
-    WM_NCCREATE, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_THEMECHANGED, WNDCLASSW, WS_OVERLAPPED,
+    AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    DispatchMessageW, FindWindowW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW,
+    IDCANCEL, IDI_APPLICATION, IDOK, LoadIconW, MB_DEFBUTTON1, MB_ICONERROR, MB_ICONINFORMATION,
+    MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MESSAGEBOX_STYLE, MF_CHECKED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SW_SHOWNORMAL, SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON,
+    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_RBUTTONUP, WM_SETTINGCHANGE,
+    WM_THEMECHANGED, WNDCLASSW, WS_OVERLAPPED,
 };
-use windows::core::{BOOL, Error as WinError, GUID, Interface, PCWSTR, PWSTR, w};
+use windows::core::{BOOL, GUID, Interface, PCWSTR, PWSTR, w};
 
-type Result<T> = std::result::Result<T, AppError>;
+use config::{Config, Language, language_code, load_config_file, save_config_file, trim_ascii};
+use error::{AppError, Result, check_bool, last_error};
+use filesystem::{
+    PlannedMove, child_entries as list_child_entries, copy_dir_all, move_path, should_manage_entry,
+    validate_moves,
+};
+use journal::{
+    Journal, JournalStage, JournalStore, RecoveryOutcome, clear_journal, read_journal,
+    recover_journal_core, write_journal,
+};
+use layout::{IconPosition, encode_layout_name, load_layout_file};
+use path_logic::{is_under_dir, normalized_path, path_equal_ci, relative_name_for_desktop_item};
+use win32::{CoApartment, Handle, OwnedIcon, OwnedMenu, RegKey};
+
 type ItemIdChild = ITEMIDLIST;
 
 const APP_VERSION: &str = "0.1.7";
@@ -99,35 +120,6 @@ const ID_TRAY_OPEN_STATE: u16 = 2005;
 const ID_TRAY_STARTUP: u16 = 2006;
 const ID_TRAY_EXIT: u16 = 2007;
 const ID_TRAY_LANG_BASE: u16 = 3000;
-
-#[derive(Debug)]
-struct AppError(String);
-
-impl std::fmt::Display for AppError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for AppError {}
-
-impl From<io::Error> for AppError {
-    fn from(value: io::Error) -> Self {
-        Self(value.to_string())
-    }
-}
-
-impl From<WinError> for AppError {
-    fn from(value: WinError) -> Self {
-        Self(value.message())
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Language {
-    En,
-    De,
-}
 
 #[derive(Clone, Copy)]
 struct Strings {
@@ -255,21 +247,6 @@ fn s() -> &'static Strings {
     }
 }
 
-fn language_code(lang: Language) -> &'static str {
-    match lang {
-        Language::En => "en",
-        Language::De => "de",
-    }
-}
-
-fn language_from_code(code: &str) -> Language {
-    if code == "de" {
-        Language::De
-    } else {
-        Language::En
-    }
-}
-
 fn detect_system_language() -> Language {
     let primary = unsafe { GetUserDefaultUILanguage() } & 0x03ff;
     if primary == 0x07 {
@@ -309,106 +286,6 @@ fn path_display(path: &Path) -> String {
     path.as_os_str().to_string_lossy().into_owned()
 }
 
-fn last_error(what: &str) -> AppError {
-    AppError(format!(
-        "{what}: {}",
-        unsafe { GetLastError() }.to_hresult().message()
-    ))
-}
-
-fn check_bool(ok: BOOL, what: &str) -> Result<()> {
-    if ok.as_bool() {
-        Ok(())
-    } else {
-        Err(last_error(what))
-    }
-}
-
-struct CoApartment {
-    initialized: bool,
-}
-
-impl CoApartment {
-    fn init() -> Result<Self> {
-        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-        if hr.is_err() {
-            if hr != RPC_E_CHANGED_MODE {
-                return Err(WinError::from_hresult(hr).into());
-            }
-            return Ok(Self { initialized: false });
-        }
-        Ok(Self { initialized: true })
-    }
-}
-
-impl Drop for CoApartment {
-    fn drop(&mut self) {
-        if self.initialized {
-            unsafe { CoUninitialize() };
-        }
-    }
-}
-
-struct Handle(HANDLE);
-
-impl Handle {
-    fn new(handle: HANDLE) -> Option<Self> {
-        if handle.is_invalid() || handle.0.is_null() {
-            None
-        } else {
-            Some(Self(handle))
-        }
-    }
-
-    fn raw(&self) -> HANDLE {
-        self.0
-    }
-}
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = CloseHandle(self.0);
-        }
-    }
-}
-
-struct RegKey(HKEY);
-
-impl RegKey {
-    fn raw(&self) -> HKEY {
-        self.0
-    }
-}
-
-impl Drop for RegKey {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = RegCloseKey(self.0);
-        }
-    }
-}
-
-struct OwnedMenu(HMENU);
-
-impl Drop for OwnedMenu {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = DestroyMenu(self.0);
-        }
-    }
-}
-
-struct OwnedIcon(HICON);
-
-impl Drop for OwnedIcon {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = DestroyIcon(self.0);
-        }
-    }
-}
-
 #[derive(Clone)]
 struct Paths {
     desktop: PathBuf,
@@ -434,6 +311,14 @@ impl Paths {
     fn layout_file(&self, guid: &str) -> PathBuf {
         self.layouts.join(format!("{guid}.tsv"))
     }
+
+    fn journal_store(&self) -> JournalStore {
+        JournalStore::new(
+            self.root.clone(),
+            self.active_file.clone(),
+            self.journal_file.clone(),
+        )
+    }
 }
 
 fn known_folder_path(id: &GUID) -> Result<PathBuf> {
@@ -452,7 +337,7 @@ fn known_folder_path(id: &GUID) -> Result<PathBuf> {
 fn paths() -> Result<Paths> {
     let _co = CoApartment::init()?;
     let root = PathBuf::from(env::var_os("LOCALAPPDATA").ok_or_else(|| {
-        AppError("Required environment variable is missing: LOCALAPPDATA".into())
+        AppError::message("Required environment variable is missing: LOCALAPPDATA")
     })?)
     .join("DeskIcons");
     Ok(Paths {
@@ -499,75 +384,12 @@ fn log_error(p: &Paths, err: &dyn std::error::Error) {
     log_line(p, &format!("ERROR {err}"));
 }
 
-#[derive(Clone)]
-struct Config {
-    enabled: bool,
-    manage_non_shortcuts: bool,
-    poll_ms: u64,
-    language: Option<Language>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            manage_non_shortcuts: true,
-            poll_ms: 750,
-            language: None,
-        }
-    }
-}
-
-fn trim_ascii(value: &str) -> &str {
-    value.trim_matches(|c: char| c.is_ascii_whitespace())
-}
-
 fn load_config(p: &Paths) -> Config {
-    let Ok(file) = File::open(&p.config_file) else {
-        return Config::default();
-    };
-    let mut config = Config::default();
-    for line in BufReader::new(file)
-        .lines()
-        .map_while(std::result::Result::ok)
-    {
-        let trimmed = trim_ascii(&line);
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once('=') else {
-            continue;
-        };
-        match trim_ascii(key) {
-            "enabled" => config.enabled = trim_ascii(value) != "0",
-            "manage_non_shortcuts" => config.manage_non_shortcuts = trim_ascii(value) != "0",
-            "poll_ms" => {
-                config.poll_ms = trim_ascii(value)
-                    .parse::<u64>()
-                    .unwrap_or(750)
-                    .clamp(250, 10_000);
-            }
-            "language" => config.language = Some(language_from_code(trim_ascii(value))),
-            _ => {}
-        }
-    }
-    config
+    load_config_file(&p.config_file)
 }
 
 fn save_config(p: &Paths, config: &Config) -> Result<()> {
-    fs::create_dir_all(&p.root)?;
-    let mut out = File::create(&p.config_file)?;
-    writeln!(out, "enabled={}", if config.enabled { 1 } else { 0 })?;
-    writeln!(
-        out,
-        "manage_non_shortcuts={}",
-        if config.manage_non_shortcuts { 1 } else { 0 }
-    )?;
-    writeln!(out, "poll_ms={}", config.poll_ms)?;
-    if let Some(language) = config.language {
-        writeln!(out, "language={}", language_code(language))?;
-    }
-    Ok(())
+    save_config_file(&p.root, &p.config_file, config)
 }
 
 fn app_enabled(p: &Paths) -> bool {
@@ -613,280 +435,22 @@ fn write_text_file(path: &Path, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_skipped_desktop_entry(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("desktop.ini"))
-}
-
 fn child_entries(dir: &Path, log_paths: Option<&Paths>) -> Vec<PathBuf> {
-    let mut entries = Vec::new();
-    let Ok(read_dir) = fs::read_dir(dir) else {
-        return entries;
-    };
-    for entry in read_dir {
-        match entry {
-            Ok(entry) if !is_skipped_desktop_entry(&entry.path()) => entries.push(entry.path()),
-            Ok(_) => {}
-            Err(err) => {
-                if let Some(p) = log_paths {
-                    log_line(
-                        p,
-                        &format!("could not enumerate {}: {err}", path_display(dir)),
-                    );
-                }
-            }
+    if fs::read_dir(dir).is_err() {
+        if let Some(p) = log_paths {
+            log_line(p, &format!("could not enumerate {}", path_display(dir)));
         }
     }
-    entries.sort();
-    entries
-}
-
-fn should_manage_entry(path: &Path, config: &Config) -> bool {
-    config.manage_non_shortcuts
-        || path
-            .extension()
-            .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("lnk"))
-}
-
-fn percent_encode(value: &str) -> String {
-    let mut out = String::new();
-    for b in value.as_bytes() {
-        match *b {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'.'
-            | b'-'
-            | b'_'
-            | b' '
-            | b'\\'
-            | b'/'
-            | b':' => out.push(*b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-fn percent_decode(value: &str) -> String {
-    let mut out = Vec::with_capacity(value.len());
-    let bytes = value.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out)
-        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
-}
-
-fn encode_path(path: &Path) -> String {
-    percent_encode(&path_display(path))
-}
-
-fn decode_path(value: &str) -> PathBuf {
-    PathBuf::from(percent_decode(value))
-}
-
-#[derive(Clone)]
-struct PlannedMove {
-    from: PathBuf,
-    to: PathBuf,
-}
-
-struct Journal {
-    stage: String,
-    from_guid: String,
-    to_guid: String,
-    outbound: Vec<PlannedMove>,
-    inbound: Vec<PlannedMove>,
-}
-
-fn write_journal(p: &Paths, mut journal: Journal, stage: &str) -> Result<()> {
-    journal.stage = stage.to_string();
-    fs::create_dir_all(&p.root)?;
-    let mut out = File::create(&p.journal_file)?;
-    writeln!(out, "version\t1")?;
-    writeln!(out, "stage\t{}", journal.stage)?;
-    writeln!(out, "from\t{}", journal.from_guid)?;
-    writeln!(out, "to\t{}", journal.to_guid)?;
-    for mv in &journal.outbound {
-        writeln!(
-            out,
-            "out\t{}\t{}",
-            encode_path(&mv.from),
-            encode_path(&mv.to)
-        )?;
-    }
-    for mv in &journal.inbound {
-        writeln!(
-            out,
-            "in\t{}\t{}",
-            encode_path(&mv.from),
-            encode_path(&mv.to)
-        )?;
-    }
-    Ok(())
-}
-
-fn read_journal(p: &Paths) -> Result<Option<Journal>> {
-    let Ok(file) = File::open(&p.journal_file) else {
-        return Ok(None);
-    };
-    let mut journal = Journal {
-        stage: String::new(),
-        from_guid: String::new(),
-        to_guid: String::new(),
-        outbound: Vec::new(),
-        inbound: Vec::new(),
-    };
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        let parts: Vec<_> = line.split('\t').collect();
-        match parts.as_slice() {
-            ["stage", value] => journal.stage = (*value).to_string(),
-            ["from", value] => journal.from_guid = (*value).to_string(),
-            ["to", value] => journal.to_guid = (*value).to_string(),
-            ["out", from, to] => journal.outbound.push(PlannedMove {
-                from: decode_path(from),
-                to: decode_path(to),
-            }),
-            ["in", from, to] => journal.inbound.push(PlannedMove {
-                from: decode_path(from),
-                to: decode_path(to),
-            }),
-            _ => {}
-        }
-    }
-    if journal.stage.is_empty() {
-        journal.stage = "planned".to_string();
-    }
-    if journal.from_guid.is_empty() || journal.to_guid.is_empty() {
-        return Err(AppError("Swap journal is malformed".into()));
-    }
-    Ok(Some(journal))
-}
-
-fn clear_journal(p: &Paths) {
-    let _ = fs::remove_file(&p.journal_file);
-}
-
-fn validate_moves(moves: &[PlannedMove]) -> Result<()> {
-    for mv in moves {
-        if !mv.from.exists() {
-            return Err(AppError(format!(
-                "Source disappeared before move: {}",
-                path_display(&mv.from)
-            )));
-        }
-        if mv.to.exists() {
-            return Err(AppError(format!(
-                "Refusing to overwrite existing path: {}",
-                path_display(&mv.to)
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn move_path(from: &Path, to: &Path) -> Result<()> {
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if from.is_dir() {
-        match fs::rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(rename_err) => {
-                copy_dir_all(from, to).map_err(|copy_err| {
-                    AppError(format!(
-                        "Could not copy directory {} -> {} after rename failed ({rename_err}): {copy_err}",
-                        path_display(from),
-                        path_display(to)
-                    ))
-                })?;
-                fs::remove_dir_all(from).map_err(|remove_err| {
-                    AppError(format!(
-                        "Copied directory to {}, but could not remove original {}: {remove_err}",
-                        path_display(to),
-                        path_display(from)
-                    ))
-                })?;
-                return Ok(());
-            }
-        }
-    }
-    let from_w = wide(from.as_os_str());
-    let to_w = wide(to.as_os_str());
-    unsafe {
-        MoveFileExW(
-            PCWSTR(from_w.as_ptr()),
-            PCWSTR(to_w.as_ptr()),
-            MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH,
-        )
-        .map_err(|_| {
-            last_error(&format!(
-                "MoveFileExW {} -> {}",
-                path_display(from),
-                path_display(to)
-            ))
-        })
-    }
-}
-
-fn move_completed_or_finish(mv: &PlannedMove) -> Result<bool> {
-    let src_exists = mv.from.exists();
-    let dst_exists = mv.to.exists();
-    if src_exists && dst_exists {
-        return Err(AppError(format!(
-            "Recovery conflict: both source and destination exist for {}",
-            path_display(&mv.from)
-        )));
-    }
-    if src_exists && !dst_exists {
-        move_path(&mv.from, &mv.to)?;
-        return Ok(true);
-    }
-    if !src_exists && !dst_exists {
-        return Err(AppError(format!(
-            "Recovery lost both source and destination: {} -> {}",
-            path_display(&mv.from),
-            path_display(&mv.to)
-        )));
-    }
-    Ok(dst_exists)
-}
-
-fn finish_move_set(moves: &[PlannedMove]) -> Result<()> {
-    for mv in moves {
-        move_completed_or_finish(mv)?;
-    }
-    Ok(())
-}
-
-fn rollback_move_set(moves: &[PlannedMove]) -> Result<()> {
-    for mv in moves.iter().rev() {
-        move_completed_or_finish(&PlannedMove {
-            from: mv.to.clone(),
-            to: mv.from.clone(),
-        })?;
-    }
-    Ok(())
+    list_child_entries(dir)
 }
 
 fn recover_journal(p: &Paths, verbose: bool) -> Result<bool> {
-    let Some(journal) = read_journal(p)? else {
+    let Some(journal) = read_journal(&p.journal_file)? else {
         return Ok(false);
     };
     if verbose {
         println!("Recovering interrupted swap");
-        println!("  stage: {}", journal.stage);
+        println!("  stage: {}", journal.stage.as_str());
         println!("  from:  {}", journal.from_guid);
         println!("  to:    {}", journal.to_guid);
     }
@@ -894,34 +458,17 @@ fn recover_journal(p: &Paths, verbose: bool) -> Result<bool> {
         p,
         &format!(
             "recovering interrupted swap stage={} {} -> {}",
-            journal.stage, journal.from_guid, journal.to_guid
+            journal.stage.as_str(),
+            journal.from_guid,
+            journal.to_guid
         ),
     );
-    match journal.stage.as_str() {
-        "planned" => {
-            rollback_move_set(&journal.outbound)?;
-            set_active_desktop(p, &journal.from_guid)?;
-        }
-        "outbound-complete" | "inbound-complete" => {
-            finish_move_set(&journal.outbound)?;
-            finish_move_set(&journal.inbound)?;
-            set_active_desktop(p, &journal.to_guid)?;
-            refresh_desktop(p);
-            restore_layout(p, &journal.to_guid, verbose)?;
-        }
-        "rollback" => {
-            rollback_move_set(&journal.inbound)?;
-            rollback_move_set(&journal.outbound)?;
-            set_active_desktop(p, &journal.from_guid)?;
-        }
-        _ => {
-            return Err(AppError(format!(
-                "Swap journal has unknown stage: {}",
-                journal.stage
-            )));
-        }
+    let to_guid = journal.to_guid.clone();
+    let outcome = recover_journal_core(&p.journal_store())?;
+    if outcome == RecoveryOutcome::CompletedToTarget {
+        refresh_desktop(p);
+        restore_layout(p, &to_guid, verbose)?;
     }
-    clear_journal(p);
     refresh_desktop(p);
     log_line(p, "recovered interrupted swap");
     Ok(true)
@@ -1090,58 +637,6 @@ fn parsing_path_for_item(folder: &IShellFolder, item: *const ItemIdChild) -> Opt
     }
 }
 
-fn normalized_path(path: &Path) -> Option<PathBuf> {
-    fs::canonicalize(path)
-        .ok()
-        .or_else(|| path.canonicalize().ok())
-        .or_else(|| Some(path.to_path_buf()))
-}
-
-fn path_equal_ci(a: &Path, b: &Path) -> bool {
-    path_display(a).to_lowercase() == path_display(b).to_lowercase()
-}
-
-fn is_under_dir(child: &Path, parent: &Path, strict: bool) -> bool {
-    let Some(child) = normalized_path(child) else {
-        return false;
-    };
-    let Some(parent) = normalized_path(parent) else {
-        return false;
-    };
-    if path_equal_ci(&child, &parent) {
-        return !strict;
-    }
-    let child_parts: Vec<_> = child.components().collect();
-    let parent_parts: Vec<_> = parent.components().collect();
-    child_parts.len() > parent_parts.len()
-        && parent_parts.iter().zip(child_parts.iter()).all(|(a, b)| {
-            a.as_os_str().to_string_lossy().to_lowercase()
-                == b.as_os_str().to_string_lossy().to_lowercase()
-        })
-}
-
-fn relative_name_for_desktop_item(item_path: &Path, desktop: &Path) -> String {
-    let Some(child) = normalized_path(item_path) else {
-        return String::new();
-    };
-    let Some(parent) = normalized_path(desktop) else {
-        return String::new();
-    };
-    if !is_under_dir(&child, &parent, true) {
-        return String::new();
-    }
-    let child_parts: Vec<_> = child.components().collect();
-    let parent_parts: Vec<_> = parent.components().collect();
-    if child_parts.len() <= parent_parts.len() {
-        return String::new();
-    }
-    let mut rel = PathBuf::new();
-    for part in child_parts.iter().skip(parent_parts.len()) {
-        rel.push(part.as_os_str());
-    }
-    path_display(&rel)
-}
-
 fn save_layout(p: &Paths, guid: &str) -> Result<()> {
     let _co = CoApartment::init()?;
     unsafe {
@@ -1162,7 +657,7 @@ fn save_layout(p: &Paths, guid: &str) -> Result<()> {
                     if is_under_dir(&item_path, &p.desktop, true) {
                         let rel = relative_name_for_desktop_item(&item_path, &p.desktop);
                         if !rel.is_empty() {
-                            writeln!(out, "{}\t{}\t{}", percent_encode(&rel), pt.x, pt.y)?;
+                            writeln!(out, "{}\t{}\t{}", encode_layout_name(&rel), pt.x, pt.y)?;
                         }
                     }
                 }
@@ -1174,27 +669,12 @@ fn save_layout(p: &Paths, guid: &str) -> Result<()> {
 }
 
 fn load_layout(path: &Path) -> (BTreeMap<String, POINT>, usize) {
-    let mut result = BTreeMap::new();
-    let mut skipped = 0;
-    let Ok(file) = File::open(path) else {
-        return (result, skipped);
-    };
-    for line in BufReader::new(file)
-        .lines()
-        .map_while(std::result::Result::ok)
-    {
-        let parts: Vec<_> = line.split('\t').collect();
-        if parts.len() >= 3 {
-            if let (Ok(x), Ok(y)) = (parts[1].parse::<i32>(), parts[2].parse::<i32>()) {
-                result.insert(percent_decode(parts[0]), POINT { x, y });
-            } else {
-                skipped += 1;
-            }
-        } else {
-            skipped += 1;
-        }
-    }
-    (result, skipped)
+    let (layout, skipped) = load_layout_file(path);
+    let points = layout
+        .into_iter()
+        .map(|(name, IconPosition { x, y })| (name, POINT { x, y }))
+        .collect();
+    (points, skipped)
 }
 
 fn desktop_folder_view2(view: &IFolderView) -> Option<IFolderView2> {
@@ -1471,7 +951,7 @@ fn moves_from_to(
 ) -> Vec<PlannedMove> {
     child_entries(from_dir, log_paths)
         .into_iter()
-        .filter(|item| should_manage_entry(item, config))
+        .filter(|item| should_manage_entry(item, config.manage_non_shortcuts))
         .map(|item| PlannedMove {
             to: to_dir.join(item.file_name().unwrap_or_default()),
             from: item,
@@ -1503,7 +983,7 @@ fn switch_to_current_desktop(p: &Paths, dry_run: bool) -> Result<()> {
     }
     let current = current_virtual_desktop_guid()
         .map(|g| guid_to_string(&g))
-        .ok_or_else(|| AppError("Could not determine current virtual desktop GUID. Windows virtual desktop registry keys may have changed.".into()))?;
+        .ok_or_else(|| AppError::message("Could not determine current virtual desktop GUID. Windows virtual desktop registry keys may have changed."))?;
     ensure_dirs(p)?;
     fs::create_dir_all(p.set_files(&current))?;
     let Some(active) = read_text_file_trimmed(&p.active_file) else {
@@ -1534,7 +1014,7 @@ fn switch_to_current_desktop(p: &Paths, dry_run: bool) -> Result<()> {
     let outbound = moves_from_to(&p.desktop, &active_files, &config, Some(p));
     let inbound = moves_from_to(&target_files, &p.desktop, &config, Some(p));
     let journal = Journal {
-        stage: "planned".into(),
+        stage: JournalStage::Planned,
         from_guid: active.clone(),
         to_guid: current.clone(),
         outbound: outbound.clone(),
@@ -1542,11 +1022,11 @@ fn switch_to_current_desktop(p: &Paths, dry_run: bool) -> Result<()> {
     };
     validate_moves(&outbound)?;
     if !dry_run {
-        write_journal(p, journal, "planned")?;
+        write_journal(&p.journal_store(), journal, JournalStage::Planned)?;
     }
     apply_moves(&outbound, dry_run, Some(p))?;
     let journal = Journal {
-        stage: "outbound-complete".into(),
+        stage: JournalStage::OutboundComplete,
         from_guid: active.clone(),
         to_guid: current.clone(),
         outbound: outbound.clone(),
@@ -1555,19 +1035,19 @@ fn switch_to_current_desktop(p: &Paths, dry_run: bool) -> Result<()> {
     if let Err(err) = (|| -> Result<()> {
         validate_moves(&inbound)?;
         if !dry_run {
-            write_journal(p, journal, "outbound-complete")?;
+            write_journal(&p.journal_store(), journal, JournalStage::OutboundComplete)?;
         }
         apply_moves(&inbound, dry_run, Some(p))
     })() {
         if !dry_run {
             let rollback_journal = Journal {
-                stage: "rollback".into(),
+                stage: JournalStage::Rollback,
                 from_guid: active.clone(),
                 to_guid: current.clone(),
                 outbound: outbound.clone(),
                 inbound: inbound.clone(),
             };
-            let _ = write_journal(p, rollback_journal, "rollback");
+            let _ = write_journal(&p.journal_store(), rollback_journal, JournalStage::Rollback);
             let rollback: Vec<_> = outbound
                 .iter()
                 .map(|mv| PlannedMove {
@@ -1583,25 +1063,29 @@ fn switch_to_current_desktop(p: &Paths, dry_run: bool) -> Result<()> {
                 );
             } else {
                 set_active_desktop(p, &active)?;
-                clear_journal(p);
+                clear_journal(&p.journal_file);
             }
         }
         return Err(err);
     }
     if !dry_run {
         let complete_journal = Journal {
-            stage: "inbound-complete".into(),
+            stage: JournalStage::InboundComplete,
             from_guid: active.clone(),
             to_guid: current.clone(),
             outbound,
             inbound,
         };
-        write_journal(p, complete_journal, "inbound-complete")?;
+        write_journal(
+            &p.journal_store(),
+            complete_journal,
+            JournalStage::InboundComplete,
+        )?;
         set_active_desktop(p, &current)?;
         refresh_desktop(p);
         thread::sleep(Duration::from_millis(250));
         restore_layout(p, &current, true)?;
-        clear_journal(p);
+        clear_journal(&p.journal_file);
         log_line(p, &format!("switch complete {active} -> {current}"));
     }
     Ok(())
@@ -1674,11 +1158,11 @@ fn create_run_key() -> Result<RegKey> {
         )
     };
     if status != ERROR_SUCCESS {
-        return Err(AppError(format!(
+        return Err(AppError::message(format!(
             "Could not open Run registry key: {status:?}"
         )));
     }
-    Ok(RegKey(key))
+    Ok(RegKey::new(key))
 }
 
 fn set_startup_enabled_for_exe(target_exe: &Path, enabled: bool) -> Result<()> {
@@ -1709,7 +1193,7 @@ fn set_startup_enabled_for_exe(target_exe: &Path, enabled: bool) -> Result<()> {
     if status == ERROR_SUCCESS {
         Ok(())
     } else {
-        Err(AppError(format!(
+        Err(AppError::message(format!(
             "Could not update startup registration: {status:?}"
         )))
     }
@@ -1732,7 +1216,7 @@ fn open_path(path: &Path) -> Result<()> {
         )
     };
     if rc.0 as isize <= 32 {
-        Err(AppError(format!(
+        Err(AppError::message(format!(
             "ShellExecuteW failed opening {}: code {}",
             path_display(path),
             rc.0 as isize
@@ -2074,7 +1558,7 @@ fn register_uninstall_key(p: &Paths, target_exe: &Path) {
     if status != ERROR_SUCCESS {
         return;
     }
-    let key = RegKey(key);
+    let key = RegKey::new(key);
     let set_sz = |name: PCWSTR, value: String| {
         let data = wide_str(&value);
         unsafe {
@@ -2886,7 +2370,7 @@ fn open_notify_key(subkey: PCWSTR, event: HANDLE) -> Option<RegKey> {
     if opened != ERROR_SUCCESS {
         return None;
     }
-    let key = RegKey(raw);
+    let key = RegKey::new(raw);
     let notified = unsafe {
         RegNotifyChangeKeyValue(
             key.raw(),
@@ -2955,20 +2439,6 @@ fn export_state(p: &Paths) -> Result<PathBuf> {
     Ok(dest)
 }
 
-fn copy_dir_all(from: &Path, to: &Path) -> io::Result<()> {
-    fs::create_dir_all(to)?;
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_all(&entry.path(), &target)?;
-        } else {
-            fs::copy(entry.path(), target)?;
-        }
-    }
-    Ok(())
-}
-
 fn print_usage() {
     println!(
         "DeskIcons {APP_VERSION}\n\nUsage:\n  deskicons status\n  deskicons adopt --yes\n  deskicons switch-once [--dry-run]\n  deskicons restore-layout --yes\n  deskicons dump-visible\n  deskicons recover\n  deskicons enable|disable\n  deskicons startup on|off\n  deskicons export-state\n  deskicons tray\n  deskicons agent [--dry-run]\n\nNotes:\n  status is read-only.\n  adopt records the current virtual desktop as the owner of current user Desktop items.\n  switch-once swaps user Desktop folder contents if Windows is now on another virtual desktop.\n  restore-layout reapplies the saved icon positions for the current virtual desktop.\n  dump-visible prints Explorer's current user Desktop item names and positions.\n  recover completes or rolls back an interrupted journaled swap according to journal stage.\n  tray runs the tray UI.\n  agent polls the current virtual desktop and runs switch-once on desktop changes.\n  Public Desktop icons remain visible but unmanaged.\n  Virtual desktop detection depends on undocumented Windows Explorer registry state."
@@ -2993,13 +2463,13 @@ fn acquire_single_instance() -> Result<Handle> {
         .map_err(|_| last_error("CreateMutexW"))?;
     let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     let Some(handle) = Handle::new(mutex) else {
-        return Err(AppError(
-            "Could not create DeskIcons single-instance mutex".into(),
+        return Err(AppError::message(
+            "Could not create DeskIcons single-instance mutex",
         ));
     };
     if already_running {
-        return Err(AppError(
-            "Another DeskIcons instance is already running. Stop the tray instance before running this command.".into(),
+        return Err(AppError::message(
+            "Another DeskIcons instance is already running. Stop the tray instance before running this command.",
         ));
     }
     Ok(handle)
@@ -3058,9 +2528,9 @@ fn command_main() -> Result<i32> {
         "status" => print_status(&p),
         "adopt" => {
             if !args.iter().any(|a| a == "--yes") {
-                return Err(AppError("adopt requires --yes".into()));
+                return Err(AppError::message("adopt requires --yes"));
             }
-            let current = current_virtual_desktop_guid().ok_or_else(|| AppError("Could not determine current virtual desktop GUID. Windows virtual desktop registry keys may have changed.".into()))?;
+            let current = current_virtual_desktop_guid().ok_or_else(|| AppError::message("Could not determine current virtual desktop GUID. Windows virtual desktop registry keys may have changed."))?;
             let guid = guid_to_string(&current);
             adopt_current_desktop(&p, &guid)?;
             println!("Adopted current desktop set {guid}");
@@ -3068,9 +2538,9 @@ fn command_main() -> Result<i32> {
         "switch-once" => switch_to_current_desktop(&p, dry_run)?,
         "restore-layout" => {
             if !args.iter().any(|a| a == "--yes") {
-                return Err(AppError("restore-layout requires --yes".into()));
+                return Err(AppError::message("restore-layout requires --yes"));
             }
-            let current = current_virtual_desktop_guid().ok_or_else(|| AppError("Could not determine current virtual desktop GUID. Windows virtual desktop registry keys may have changed.".into()))?;
+            let current = current_virtual_desktop_guid().ok_or_else(|| AppError::message("Could not determine current virtual desktop GUID. Windows virtual desktop registry keys may have changed."))?;
             restore_layout(&p, &guid_to_string(&current), true)?;
         }
         "dump-visible" => dump_visible_items(&p)?,
@@ -3089,7 +2559,7 @@ fn command_main() -> Result<i32> {
         }
         "startup" => {
             if args.get(1).is_none_or(|v| v != "on" && v != "off") {
-                return Err(AppError("startup requires 'on' or 'off'".into()));
+                return Err(AppError::message("startup requires 'on' or 'off'"));
             }
             set_startup_enabled(args[1] == "on")?;
             println!(
@@ -3107,7 +2577,7 @@ fn command_main() -> Result<i32> {
         }
         "uninstall" => {
             if parked_files_exist(&p) {
-                return Err(AppError(format!(
+                return Err(AppError::message(format!(
                     "Refusing to uninstall because parked desktop files still exist under {}. Switch through your virtual desktops or export state before uninstalling so user data is not deleted.",
                     path_display(&p.sets)
                 )));
@@ -3148,37 +2618,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn percent_encoding_round_trips_unicode_names() {
-        let value = r#"Desktop\ä-東京-😀 %.txt"#;
-        let encoded = percent_encode(value);
-        assert_ne!(encoded, value);
-        assert_eq!(percent_decode(&encoded), value);
-        assert!(encoded.contains("%C3%A4"));
-        assert!(encoded.contains("%F0%9F%98%80"));
-    }
-
-    #[test]
-    fn recovery_errors_when_both_move_paths_are_missing() {
-        let base = env::temp_dir().join(format!("deskicons-test-{}", unsafe {
-            GetCurrentProcessId()
-        }));
-        let _ = fs::remove_dir_all(&base);
-        let mv = PlannedMove {
-            from: base.join("missing-source"),
-            to: base.join("missing-destination"),
-        };
-        let err = move_completed_or_finish(&mv).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Recovery lost both source and destination")
-        );
-    }
-
-    #[test]
     fn fixed_wide_buffers_are_nul_terminated_when_truncated() {
         let source = wide_str("abcdef");
         let mut dest = [99u16; 4];
         copy_wide_truncated(&mut dest, &source);
         assert_eq!(&dest, &[b'a' as u16, b'b' as u16, b'c' as u16, 0]);
+    }
+
+    #[test]
+    fn startup_command_quotes_target_path_and_runs_tray() {
+        let command = startup_command_for(Path::new(r"C:\Program Files\DeskIcons\deskicons.exe"));
+        assert_eq!(
+            command,
+            r#""C:\Program Files\DeskIcons\deskicons.exe" tray"#
+        );
     }
 }
