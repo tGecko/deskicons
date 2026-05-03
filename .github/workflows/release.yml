@@ -20,35 +20,63 @@ jobs:
           $version = "${{ github.ref_name }}".TrimStart('v')
           "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Patch version in CMakeLists.txt
+      - name: Patch Rust version metadata
         shell: pwsh
         run: |
           $v = $env:VERSION
-          (Get-Content CMakeLists.txt -Raw) `
-            -replace 'set\(CPACK_PACKAGE_VERSION "[^"]*"\)', "set(CPACK_PACKAGE_VERSION `"$v`")" `
-            -replace 'set\(CPACK_PACKAGE_FILE_NAME "[^"]*"\)', "set(CPACK_PACKAGE_FILE_NAME `"DeskIcons-$v-win64`")" |
-            Set-Content CMakeLists.txt -NoNewline
+          (Get-Content Cargo.toml -Raw) `
+            -replace '(?m)^version = "[^"]*"', "version = `"$v`"" |
+            Set-Content Cargo.toml -NoNewline
 
-      - name: Patch version in main.cpp
+          (Get-Content src/main.rs -Raw) `
+            -replace '(const APP_VERSION: &str = )"[^"]*"', "`$1`"$v`"" |
+            Set-Content src/main.rs -NoNewline
+
+          $fileVersion = (($v -split '\.') + @('0', '0', '0', '0'))[0..3] -join ','
+          (Get-Content deskicons.rc -Raw) `
+            -replace 'FILEVERSION [0-9,]+', "FILEVERSION $fileVersion" `
+            -replace 'PRODUCTVERSION [0-9,]+', "PRODUCTVERSION $fileVersion" `
+            -replace 'VALUE "FileVersion", "[^"]*"', "VALUE `"FileVersion`", `"$v`"" `
+            -replace 'VALUE "ProductVersion", "[^"]*"', "VALUE `"ProductVersion`", `"$v`"" |
+            Set-Content deskicons.rc -NoNewline
+
+          $manifestVersion = (($v -split '\.') + @('0', '0', '0', '0'))[0..3] -join '.'
+          (Get-Content app.manifest -Raw) `
+            -replace 'assemblyIdentity version="[^"]*"', "assemblyIdentity version=`"$manifestVersion`"" |
+            Set-Content app.manifest -NoNewline
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Assert Rust 1.95
         shell: pwsh
         run: |
-          $v = $env:VERSION
-          (Get-Content src/main.cpp -Raw) `
-            -replace '(constexpr const char \*kAppVersion = )"[^"]*"', "`$1`"$v`"" |
-            Set-Content src/main.cpp -NoNewline
-
-      - name: Configure CMake
-        run: cmake -B build -A x64
+          rustup toolchain install 1.95.0
+          rustup default 1.95.0
+          rustc --version
+          cargo --version
 
       - name: Build
-        run: cmake --build build --config Release
+        run: cargo build --release
+
+      - name: Clippy
+        run: cargo clippy --release -- -D warnings
+
+      - name: Test
+        run: cargo test
 
       - name: Package
-        working-directory: build
-        run: cpack -C Release
+        shell: pwsh
+        run: |
+          $stage = "dist/DeskIcons-$env:VERSION-win64"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target/release/deskicons.exe "$stage/deskicons.exe"
+          Copy-Item README.dist.md "$stage/README.md"
+          Copy-Item README_de.dist.md "$stage/README_de.md"
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/DeskIcons-$env:VERSION-win64.zip" -Force
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: build/DeskIcons-${{ env.VERSION }}-win64.zip
+          files: dist/DeskIcons-${{ env.VERSION }}-win64.zip
           generate_release_notes: true

@@ -5,14 +5,13 @@ DeskIcons assigns different visible user Desktop contents to different Windows v
 ## Build
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 18 2026" -A x64
-cmake --build build --config Release
+cargo build --release
 ```
 
-Create the release ZIP:
+The executable is written to:
 
 ```powershell
-cmake --build build --config Release --target PACKAGE
+target\release\deskicons.exe
 ```
 
 OneDrive Desktop redirection is detected as a warning in `status`, but it still needs broader testing.
